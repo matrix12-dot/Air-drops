@@ -20,7 +20,7 @@ export function generateStarkId(): string {
 }
 
 export function normalizePeerId(raw: string): string {
-  const trimmed = raw.trim();
+  const trimmed = raw.replace(/[\u200B-\u200F\uFEFF]/g, '').trim();
   if (!trimmed) return '';
 
   // Support pasting a full ?connect=STARK-XXX URL
@@ -39,18 +39,62 @@ export function normalizePeerId(raw: string): string {
     }
   }
 
-  const upper = trimmed.toUpperCase().replace(/\s+/g, '');
+  const normalizedDashes = trimmed.replace(/[–—−ـ]/g, '-');
+  const upper = normalizedDashes.toUpperCase().replace(/\s+/g, '');
   if (upper.startsWith('STARK-')) {
     return upper;
   }
   if (upper.startsWith('STARK') && upper.length > 5) {
     return `STARK-${upper.slice(5).replace(/^-+/, '')}`;
   }
-  // If user typed just the short 3-4 char suffix (e.g. "94X"), prepend STARK-
+  // If user typed just the short 3-5 char suffix (e.g. "94X"), prepend STARK-
   if (/^[A-Z0-9]{3,5}$/.test(upper)) {
     return `STARK-${upper}`;
   }
   return upper;
+}
+
+export interface CustomTurnConfig {
+  urls: string;
+  username: string;
+  credential: string;
+}
+
+const TURN_STORAGE_KEY = 'stark_custom_turn_config';
+
+export function loadCustomTurnConfig(): CustomTurnConfig | null {
+  if (typeof localStorage === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(TURN_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<CustomTurnConfig>;
+    if (parsed.urls && parsed.urls.trim()) {
+      return {
+        urls: parsed.urls.trim(),
+        username: (parsed.username || '').trim(),
+        credential: (parsed.credential || '').trim(),
+      };
+    }
+  } catch {
+    // Ignore malformed JSON
+  }
+  return null;
+}
+
+export function saveCustomTurnConfig(config: CustomTurnConfig | null): void {
+  if (typeof localStorage === 'undefined') return;
+  if (!config || !config.urls.trim()) {
+    localStorage.removeItem(TURN_STORAGE_KEY);
+    return;
+  }
+  localStorage.setItem(
+    TURN_STORAGE_KEY,
+    JSON.stringify({
+      urls: config.urls.trim(),
+      username: config.username.trim(),
+      credential: config.credential.trim(),
+    })
+  );
 }
 
 export function detectLocalDevice(): DeviceProfile {

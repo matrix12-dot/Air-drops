@@ -8,15 +8,20 @@ import {
   WireMessage,
 } from '../types/p2p';
 import {
+  CustomTurnConfig,
   detectLocalDevice,
   generateStarkId,
+  loadCustomTurnConfig,
   normalizePeerId,
+  saveCustomTurnConfig,
 } from '../utils/device';
 import { playArrivalChime, playConnectChime, primeAudioContext } from '../utils/sound';
 
 const CHUNK_SIZE = 64 * 1024; // 64KB chunks
 const MAX_BUFFERED_AMOUNT = 1024 * 1024; // 1MB high-water mark
 const BUFFER_LOW_THRESHOLD = 256 * 1024; // 256KB low-water mark
+const CONNECT_TIMEOUT_MS = 16000;
+const SIGNALING_TIMEOUT_MS = 12000;
 
 interface IncomingTransferBuffer {
   id: string;
@@ -34,6 +39,31 @@ interface IncomingTransferBuffer {
 interface OutgoingQueuedFile {
   transferId: string;
   file: File;
+}
+
+function buildIceServers(customTurn: CustomTurnConfig | null): RTCIceServer[] {
+  const servers: RTCIceServer[] = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+  ];
+
+  if (customTurn && customTurn.urls.trim()) {
+    const urls = customTurn.urls
+      .split(',')
+      .map((u) => u.trim())
+      .filter(Boolean);
+    if (urls.length > 0) {
+      servers.push({
+        urls,
+        ...(customTurn.username ? { username: customTurn.username } : {}),
+        ...(customTurn.credential ? { credential: customTurn.credential } : {}),
+      });
+    }
+  }
+
+  return servers;
 }
 
 function triggerBrowserDownload(blobUrl: string, fileName: string): void {
@@ -100,19 +130,25 @@ export function usePeerBridge(soundEnabled: boolean) {
   const [peerId, setPeerId] = useState<string>(() => generateStarkId());
   const [localDevice, setLocalDevice] = useState<DeviceProfile>(() => detectLocalDevice());
   const [connectionState, setConnectionState] = useState<ConnectionState>('initializing');
+  const [signalingReady, setSignalingReady] = useState<boolean>(false);
   const [remotePeerId, setRemotePeerId] = useState<string | null>(null);
   const [remoteDevice, setRemoteDevice] = useState<DeviceProfile | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [transfers, setTransfers] = useState<FileTransferItem[]>([]);
   const [textDrops, setTextDrops] = useState<TextDropItem[]>([]);
+  const [customTurn, setCustomTurn] = useState<CustomTurnConfig | null>(() => loadCustomTurnConfig());
+  const [peerGeneration, setPeerGeneration] = useState<number>(0);
 
   const peerRef = useRef<Peer | null>(null);
   const connRef = useRef<DataConnection | null>(null);
   const soundEnabledRef = useRef<boolean>(soundEnabled);
   const localDeviceRef = useRef<DeviceProfile>(localDevice);
   const peerIdRef = useRef<string>(peerId);
+  const customTurnRef = useRef<CustomTurnConfig | null>(customTurn);
   const pendingAutoConnectRef = useRef<string | null>(null);
   const idRetryCountRef = useRef<number>(0);
+  const connectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const signalingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const incomingTransfersRef = useRef<Map<string, IncomingTransferBuffer>>(new Map());
   const outgoingQueueRef = useRef<OutgoingQueuedFile[]>([]);
@@ -130,6 +166,24 @@ export function usePeerBridge(soundEnabled: boolean) {
   useEffect(() => {
     peerIdRef.current = peerId;
   }, [peerId]);
+
+  useEffect(() => {
+    customTurnRef.current = customTurn;
+  }, [customTurn]);
+
+  const clearConnectTimeout = useCallback(() => {
+    if (connectTimeoutRef.current) {
+      clearTimeout(connectTimeoutRef.current);
+      connectTimeoutRef.current = null;
+    }
+  }, []);
+
+  const clearSignalingTimeout = useCallback(() => {
+    if (signalingTimeoutRef.current) {
+      clearTimeout(signalingTimeoutRef.current);
+      signalingTimeoutRef.current = null;
+    }
+  }, []);
 
   // Capture ?connect=STARK-XXX on initial page load
   useEffect(() => {
@@ -221,7 +275,8 @@ export function usePeerBridge(soundEnabled: boolean) {
               const instantMBps = (offset - lastBytes) / (1024 * 1024) / dtSeconds;
               smoothedSpeed =
                 smoothedSpeed === 0 ? instantMBps : smoothedSpeed * 0.65 + instantMBps * 0.35;
-              const progress = file.size > 0 ? Math.min(99, Math.round((offset / file.size) * 100)) : 100;
+              const progress =
+                file.size > 0 ? Math.min(99, Math.round((offset / file.size) * 100)) : 100;
 
               lastUiUpdate = now;
               lastBytes = offset;
@@ -401,7 +456,6 @@ export function usePeerBridge(soundEnabled: boolean) {
         }
 
         case 'file-ack': {
-          // Confirmed received by remote peer
           break;
         }
       }
@@ -411,6 +465,8 @@ export function usePeerBridge(soundEnabled: boolean) {
 
   const attachConnection = useCallback(
     (conn: DataConnection) => {
+      clearConnectTimeout();
+
       if (connRef.current && connRef.current !== conn) {
         try {
           connRef.current.close();
@@ -423,16 +479,41 @@ export function usePeerBridge(soundEnabled: boolean) {
       setRemotePeerId(conn.peer);
       setStatusError(null);
 
+      const handleFailure = (message: string) => {
+        clearConnectTimeout();
+        if (connRef.current === conn) {
+          try {
+            conn.close();
+          } catch {
+            // Ignore
+          }
+          connRef.current = null;
+          setRemotePeerId(null);
+          setRemoteDevice(null);
+          setStatusError(message);
+          setConnectionState(
+            peerRef.current && !peerRef.current.destroyed ? 'ready' : 'error'
+          );
+        }
+      };
+
       const handleOpen = () => {
+        clearConnectTimeout();
+        if (connRef.current !== conn) return;
+
         setConnectionState('connected');
         setRemotePeerId(conn.peer);
         setStatusError(null);
         playConnectChime(soundEnabledRef.current);
 
-        conn.send({
-          type: 'hello',
-          device: localDeviceRef.current,
-        } satisfies WireMessage);
+        try {
+          conn.send({
+            type: 'hello',
+            device: localDeviceRef.current,
+          } satisfies WireMessage);
+        } catch {
+          // Ignore send race
+        }
 
         flushOutgoingQueue();
       };
@@ -441,22 +522,43 @@ export function usePeerBridge(soundEnabled: boolean) {
         handleOpen();
       } else {
         setConnectionState('connecting');
+        connectTimeoutRef.current = setTimeout(() => {
+          if (connRef.current === conn && !conn.open) {
+            const iceState = conn.peerConnection?.iceConnectionState;
+            const reason =
+              iceState === 'checking' || iceState === 'failed'
+                ? 'تعذر إنشاء مسار P2P مباشر (حظر جدار الحماية أو NAT متماثل بين الشبكتين). وصّل الجهازين على نفس Wi-Fi بدون عزل، أو أضف خادم TURN في إعدادات الشبكة.'
+                : 'انتهت مهلة انتظار استجابة الجهاز الآخر. تأكد من أن الصفحة مفتوحة ونشطة على الجهاز المقابل ثم أعد المحاولة.';
+            handleFailure(reason);
+          }
+        }, CONNECT_TIMEOUT_MS);
       }
 
       conn.on('open', handleOpen);
+
+      conn.on('iceStateChanged', (iceState) => {
+        if (connRef.current !== conn || conn.open) return;
+        if (iceState === 'failed') {
+          handleFailure(
+            'فشل التفاوض الشبكي المباشر (ICE Failed) بسبب قيود الشبكة أو NAT. جرّب ربط الجهازين بنفس نقطة الاتصال أو أضف خادم TURN.'
+          );
+        }
+      });
 
       conn.on('data', (data) => {
         void handleIncomingData(data);
       });
 
       conn.on('close', () => {
+        clearConnectTimeout();
         if (connRef.current === conn) {
           connRef.current = null;
           setRemotePeerId(null);
           setRemoteDevice(null);
-          setConnectionState(peerRef.current && !peerRef.current.destroyed ? 'ready' : 'initializing');
+          setConnectionState(
+            peerRef.current && !peerRef.current.destroyed ? 'ready' : 'error'
+          );
 
-          // Mark any in-progress incoming transfers as errored
           incomingTransfersRef.current.forEach((entry) => {
             updateTransferItem(entry.id, (prev) =>
               prev.status === 'transferring'
@@ -469,17 +571,15 @@ export function usePeerBridge(soundEnabled: boolean) {
       });
 
       conn.on('error', () => {
-        setStatusError('تعذر الحفاظ على قناة الاتصال المباشر مع الجهاز الآخر');
-        if (connRef.current === conn) {
-          connRef.current = null;
-          setRemotePeerId(null);
-          setRemoteDevice(null);
-          setConnectionState('ready');
-        }
+        handleFailure('تعذر الحفاظ على قناة الاتصال المباشر مع الجهاز الآخر.');
       });
     },
-    [flushOutgoingQueue, handleIncomingData, updateTransferItem]
+    [clearConnectTimeout, flushOutgoingQueue, handleIncomingData, updateTransferItem]
   );
+
+  const reinitializePeer = useCallback(() => {
+    setPeerGeneration((g) => g + 1);
+  }, []);
 
   const connectToPeer = useCallback(
     (rawTargetId: string) => {
@@ -493,9 +593,29 @@ export function usePeerBridge(soundEnabled: boolean) {
         setStatusError('لا يمكنك الاتصال بنفس الجهاز');
         return;
       }
+
       const peer = peerRef.current;
       if (!peer || peer.destroyed) {
         pendingAutoConnectRef.current = targetId;
+        setStatusError(null);
+        setConnectionState('connecting');
+        setRemotePeerId(targetId);
+        reinitializePeer();
+        return;
+      }
+
+      if (peer.disconnected || !peer.open) {
+        pendingAutoConnectRef.current = targetId;
+        setStatusError(null);
+        setConnectionState('connecting');
+        setRemotePeerId(targetId);
+        if (peer.disconnected) {
+          try {
+            peer.reconnect();
+          } catch {
+            reinitializePeer();
+          }
+        }
         return;
       }
 
@@ -507,9 +627,20 @@ export function usePeerBridge(soundEnabled: boolean) {
         reliable: true,
         serialization: 'binary',
       });
+
+      if (!conn) {
+        pendingAutoConnectRef.current = targetId;
+        try {
+          peer.reconnect();
+        } catch {
+          reinitializePeer();
+        }
+        return;
+      }
+
       attachConnection(conn);
     },
-    [attachConnection]
+    [attachConnection, reinitializePeer]
   );
 
   useEffect(() => {
@@ -518,16 +649,33 @@ export function usePeerBridge(soundEnabled: boolean) {
 
     const initPeer = (idToUse: string) => {
       if (!active) return;
-      setConnectionState('initializing');
+      clearSignalingTimeout();
+      setSignalingReady(false);
+      if (!connRef.current?.open) {
+        setConnectionState('initializing');
+      }
+
+      signalingTimeoutRef.current = setTimeout(() => {
+        if (!active) return;
+        if (peerInstance && !peerInstance.open && !connRef.current?.open) {
+          setSignalingReady(false);
+          setConnectionState('error');
+          setStatusError(
+            'تعذر الوصول إلى خادم الإشارات (0.peerjs.com) في الوقت المتوقع. تحقق من اتصال الإنترنت أو عدم حجب WebSocket.'
+          );
+        }
+      }, SIGNALING_TIMEOUT_MS);
 
       peerInstance = new Peer(idToUse, {
+        host: '0.peerjs.com',
+        port: 443,
+        path: '/',
+        secure: true,
+        pingInterval: 5000,
         debug: 1,
         config: {
-          iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' },
-            { urls: 'stun:stun2.l.google.com:19302' },
-          ],
+          iceServers: buildIceServers(customTurnRef.current),
+          iceCandidatePoolSize: 10,
         },
       });
 
@@ -535,9 +683,11 @@ export function usePeerBridge(soundEnabled: boolean) {
 
       peerInstance.on('open', (assignedId) => {
         if (!active) return;
+        clearSignalingTimeout();
         idRetryCountRef.current = 0;
         setPeerId(assignedId);
         peerIdRef.current = assignedId;
+        setSignalingReady(true);
         setStatusError(null);
 
         if (!connRef.current?.open) {
@@ -556,16 +706,37 @@ export function usePeerBridge(soundEnabled: boolean) {
 
       peerInstance.on('connection', (incomingConn) => {
         if (!active) return;
+        // Do not tear down an already established connection; replace only if idle or still negotiating
+        if (connRef.current && connRef.current.open) {
+          try {
+            incomingConn.close();
+          } catch {
+            // Ignore
+          }
+          return;
+        }
         attachConnection(incomingConn);
       });
 
       peerInstance.on('disconnected', () => {
         if (!active || !peerInstance || peerInstance.destroyed) return;
-        // Reconnect to signaling server while preserving active P2P DataChannel
-        try {
-          peerInstance.reconnect();
-        } catch {
-          // Ignore reconnect race
+        setSignalingReady(false);
+        setTimeout(() => {
+          if (active && peerInstance && !peerInstance.destroyed && peerInstance.disconnected) {
+            try {
+              peerInstance.reconnect();
+            } catch {
+              // Ignore reconnect race
+            }
+          }
+        }, 1000);
+      });
+
+      peerInstance.on('close', () => {
+        if (!active) return;
+        setSignalingReady(false);
+        if (!connRef.current?.open) {
+          setConnectionState('error');
         }
       });
 
@@ -574,6 +745,7 @@ export function usePeerBridge(soundEnabled: boolean) {
         const errType = (err as { type?: string }).type;
 
         if (errType === 'unavailable-id' && idRetryCountRef.current < 5) {
+          clearSignalingTimeout();
           idRetryCountRef.current += 1;
           const nextId = generateStarkId();
           setPeerId(nextId);
@@ -588,18 +760,31 @@ export function usePeerBridge(soundEnabled: boolean) {
         }
 
         if (errType === 'peer-unavailable') {
-          setStatusError('لم يتم العثور على الجهاز المطلوب. تأكد من فتح التطبيق على الجهاز الآخر وصحة الرمز.');
+          clearConnectTimeout();
+          pendingAutoConnectRef.current = null;
+          setStatusError(
+            'لم يتم العثور على الجهاز المطلوب على خادم الإشارات. تأكد من فتح الصفحة على الجهاز الآخر وصحة الرمز.'
+          );
           if (!connRef.current?.open) {
             connRef.current = null;
             setRemotePeerId(null);
             setRemoteDevice(null);
-            setConnectionState('ready');
+            setConnectionState(peerInstance?.open ? 'ready' : 'error');
           }
           return;
         }
 
-        if (errType === 'network' || errType === 'server-error' || errType === 'socket-error') {
-          setStatusError('تعذر الوصول إلى خادم الإشارات لبدء الاقتران. تحقق من اتصال الإنترنت.');
+        if (
+          errType === 'network' ||
+          errType === 'server-error' ||
+          errType === 'socket-error' ||
+          errType === 'socket-closed'
+        ) {
+          clearSignalingTimeout();
+          setSignalingReady(false);
+          setStatusError(
+            'تعذر الاتصال بخادم الإشارات لبدء الاقتران. تحقق من اتصال الإنترنت أو أعد المحاولة.'
+          );
           if (!connRef.current?.open) {
             setConnectionState('error');
           }
@@ -608,15 +793,37 @@ export function usePeerBridge(soundEnabled: boolean) {
 
         setStatusError('حدث خطأ في الاتصال المباشر. حاول إعادة الاقتران.');
         if (!connRef.current?.open) {
-          setConnectionState('ready');
+          setConnectionState(peerInstance && !peerInstance.destroyed && peerInstance.open ? 'ready' : 'error');
         }
       });
     };
 
     initPeer(peerIdRef.current);
 
+    const handleVisibilityOrOnline = () => {
+      if (!active) return;
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      const p = peerRef.current;
+      if (!p || p.destroyed) {
+        reinitializePeer();
+      } else if (p.disconnected) {
+        try {
+          p.reconnect();
+        } catch {
+          reinitializePeer();
+        }
+      }
+    };
+
+    window.addEventListener('online', handleVisibilityOrOnline);
+    document.addEventListener('visibilitychange', handleVisibilityOrOnline);
+
     return () => {
       active = false;
+      clearConnectTimeout();
+      clearSignalingTimeout();
+      window.removeEventListener('online', handleVisibilityOrOnline);
+      document.removeEventListener('visibilitychange', handleVisibilityOrOnline);
       try {
         connRef.current?.close();
       } catch {
@@ -630,9 +837,36 @@ export function usePeerBridge(soundEnabled: boolean) {
       blobUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
       blobUrlsRef.current = [];
     };
-  }, [attachConnection, connectToPeer]);
+  }, [
+    attachConnection,
+    clearConnectTimeout,
+    clearSignalingTimeout,
+    connectToPeer,
+    peerGeneration,
+    reinitializePeer,
+  ]);
+
+  const cancelConnect = useCallback(() => {
+    clearConnectTimeout();
+    pendingAutoConnectRef.current = null;
+    if (connRef.current && !connRef.current.open) {
+      try {
+        connRef.current.close();
+      } catch {
+        // Ignore
+      }
+      connRef.current = null;
+    }
+    setRemotePeerId(null);
+    setRemoteDevice(null);
+    setStatusError(null);
+    setConnectionState(
+      peerRef.current && !peerRef.current.destroyed && peerRef.current.open ? 'ready' : 'error'
+    );
+  }, [clearConnectTimeout]);
 
   const disconnectPeer = useCallback(() => {
+    clearConnectTimeout();
     if (connRef.current) {
       try {
         connRef.current.close();
@@ -644,8 +878,35 @@ export function usePeerBridge(soundEnabled: boolean) {
     setRemotePeerId(null);
     setRemoteDevice(null);
     setStatusError(null);
-    setConnectionState(peerRef.current && !peerRef.current.destroyed ? 'ready' : 'initializing');
-  }, []);
+    setConnectionState(
+      peerRef.current && !peerRef.current.destroyed && peerRef.current.open ? 'ready' : 'error'
+    );
+  }, [clearConnectTimeout]);
+
+  const reconnectServer = useCallback(() => {
+    setStatusError(null);
+    const p = peerRef.current;
+    if (p && !p.destroyed && p.disconnected) {
+      setConnectionState('initializing');
+      try {
+        p.reconnect();
+        return;
+      } catch {
+        // Fall through to full reinitialize
+      }
+    }
+    reinitializePeer();
+  }, [reinitializePeer]);
+
+  const applyCustomTurnConfig = useCallback(
+    (config: CustomTurnConfig | null) => {
+      saveCustomTurnConfig(config);
+      setCustomTurn(config);
+      customTurnRef.current = config;
+      reinitializePeer();
+    },
+    [reinitializePeer]
+  );
 
   const sendFiles = useCallback(
     (files: FileList | File[]) => {
@@ -761,13 +1022,18 @@ export function usePeerBridge(soundEnabled: boolean) {
     peerId,
     localDevice,
     connectionState,
+    signalingReady,
     remotePeerId,
     remoteDevice,
     statusError,
     transfers,
     textDrops,
+    customTurn,
     connectToPeer,
+    cancelConnect,
     disconnectPeer,
+    reconnectServer,
+    applyCustomTurnConfig,
     sendFiles,
     sendTextDrop,
     updateLocalDeviceName,

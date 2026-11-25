@@ -28,13 +28,18 @@ export default function App() {
     peerId,
     localDevice,
     connectionState,
+    signalingReady,
     remotePeerId,
     remoteDevice,
     statusError,
     transfers,
     textDrops,
+    customTurn,
     connectToPeer,
+    cancelConnect,
     disconnectPeer,
+    reconnectServer,
+    applyCustomTurnConfig,
     sendFiles,
     sendTextDrop,
     updateLocalDeviceName,
@@ -76,12 +81,17 @@ export default function App() {
               peerId={peerId}
               localDevice={localDevice}
               connectionState={connectionState}
+              signalingReady={signalingReady}
               remotePeerId={remotePeerId}
               remoteDevice={remoteDevice}
               statusError={statusError}
+              customTurn={customTurn}
               onConnect={connectToPeer}
+              onCancelConnect={cancelConnect}
               onDisconnect={disconnectPeer}
+              onReconnectServer={reconnectServer}
               onUpdateLocalName={updateLocalDeviceName}
+              onApplyCustomTurn={applyCustomTurnConfig}
               onClearError={clearError}
             />
           </div>

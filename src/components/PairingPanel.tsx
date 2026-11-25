@@ -2,29 +2,38 @@ import { useState, FormEvent } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import {
   Check,
+  ChevronDown,
   Copy,
   Edit3,
   Link2,
   Loader2,
   Maximize2,
   QrCode,
+  RefreshCw,
+  Settings2,
   Unplug,
   Wifi,
   X,
 } from 'lucide-react';
 import { ConnectionState, DeviceProfile } from '../types/p2p';
+import { CustomTurnConfig } from '../utils/device';
 import { DeviceIcon } from './DeviceIcon';
 
 interface PairingPanelProps {
   peerId: string;
   localDevice: DeviceProfile;
   connectionState: ConnectionState;
+  signalingReady: boolean;
   remotePeerId: string | null;
   remoteDevice: DeviceProfile | null;
   statusError: string | null;
+  customTurn: CustomTurnConfig | null;
   onConnect: (targetId: string) => void;
+  onCancelConnect: () => void;
   onDisconnect: () => void;
+  onReconnectServer: () => void;
   onUpdateLocalName: (name: string) => void;
+  onApplyCustomTurn: (config: CustomTurnConfig | null) => void;
   onClearError: () => void;
 }
 
@@ -32,12 +41,17 @@ export function PairingPanel({
   peerId,
   localDevice,
   connectionState,
+  signalingReady,
   remotePeerId,
   remoteDevice,
   statusError,
+  customTurn,
   onConnect,
+  onCancelConnect,
   onDisconnect,
+  onReconnectServer,
   onUpdateLocalName,
+  onApplyCustomTurn,
   onClearError,
 }: PairingPanelProps) {
   const [targetInput, setTargetInput] = useState('');
@@ -46,6 +60,10 @@ export function PairingPanel({
   const [isEditingName, setIsEditingName] = useState(false);
   const [draftName, setDraftName] = useState(localDevice.name);
   const [showLargeQr, setShowLargeQr] = useState(false);
+  const [showTurnSettings, setShowTurnSettings] = useState(false);
+  const [turnUrls, setTurnUrls] = useState(customTurn?.urls || '');
+  const [turnUsername, setTurnUsername] = useState(customTurn?.username || '');
+  const [turnCredential, setTurnCredential] = useState(customTurn?.credential || '');
 
   const pairingUrl =
     typeof window !== 'undefined'
@@ -86,8 +104,32 @@ export function PairingPanel({
     setIsEditingName(false);
   };
 
+  const handleSaveTurn = (e: FormEvent) => {
+    e.preventDefault();
+    if (!turnUrls.trim()) {
+      onApplyCustomTurn(null);
+    } else {
+      onApplyCustomTurn({
+        urls: turnUrls.trim(),
+        username: turnUsername.trim(),
+        credential: turnCredential.trim(),
+      });
+    }
+    setShowTurnSettings(false);
+  };
+
+  const handleResetTurn = () => {
+    setTurnUrls('');
+    setTurnUsername('');
+    setTurnCredential('');
+    onApplyCustomTurn(null);
+    setShowTurnSettings(false);
+  };
+
   const isConnected = connectionState === 'connected';
   const isConnecting = connectionState === 'connecting';
+  const isInitializing = connectionState === 'initializing';
+  const isError = connectionState === 'error';
 
   return (
     <section
@@ -103,14 +145,16 @@ export function PairingPanel({
               className={`w-10 h-10 rounded-2xl flex items-center justify-center shrink-0 border ${
                 isConnected
                   ? 'bg-emerald-500/15 border-emerald-400/30 text-emerald-300'
-                  : isConnecting
+                  : isConnecting || isInitializing
                     ? 'bg-cyan-500/15 border-cyan-400/30 text-cyan-300'
-                    : 'bg-white/[0.05] border-white/10 text-cyan-300'
+                    : isError
+                      ? 'bg-rose-500/15 border-rose-400/30 text-rose-300'
+                      : 'bg-white/[0.05] border-white/10 text-cyan-300'
               }`}
             >
               {isConnected ? (
                 <Wifi className="w-5 h-5" aria-hidden="true" />
-              ) : isConnecting ? (
+              ) : isConnecting || isInitializing ? (
                 <Loader2 className="w-5 h-5 animate-spin" aria-hidden="true" />
               ) : (
                 <QrCode className="w-5 h-5" aria-hidden="true" />
@@ -123,7 +167,11 @@ export function PairingPanel({
               <p className="text-xs text-slate-400 truncate">
                 {isConnected
                   ? 'نقل مشفّر من جهاز لجهاز عبر WebRTC'
-                  : 'شارك الرمز أو امسح QR لبدء النقل'}
+                  : signalingReady
+                    ? 'مسجّل على خادم الإشارات وجاهز للاقتران'
+                    : isError
+                      ? 'خادم الإشارات غير متصل حالياً'
+                      : 'جاري تسجيل المعرّف على خادم الإشارات...'}
               </p>
             </div>
           </div>
@@ -138,45 +186,70 @@ export function PairingPanel({
               <span>قطع الاتصال</span>
             </button>
           )}
+
+          {!isConnected && (isError || !signalingReady) && !isInitializing && (
+            <button
+              type="button"
+              onClick={onReconnectServer}
+              className="inline-flex items-center gap-1.5 px-3 py-2 min-h-[40px] rounded-xl text-xs font-semibold text-cyan-300 bg-cyan-500/10 hover:bg-cyan-500/20 border border-cyan-400/25 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <RefreshCw className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>إعادة الاتصال</span>
+            </button>
+          )}
         </div>
 
         {/* Live Telemetry Connection Badge */}
         <div
           role="status"
           aria-live="polite"
-          className={`rounded-2xl px-4 py-3 border flex items-center gap-3 text-xs sm:text-sm font-semibold ${
+          className={`rounded-2xl px-4 py-3 border flex items-center justify-between gap-3 text-xs sm:text-sm font-semibold ${
             isConnected
               ? 'bg-emerald-500/10 border-emerald-400/25 text-emerald-200'
               : isConnecting
                 ? 'bg-cyan-500/10 border-cyan-400/25 text-cyan-200'
-                : connectionState === 'error'
+                : isError
                   ? 'bg-rose-500/10 border-rose-400/25 text-rose-200'
                   : 'bg-white/[0.03] border-white/10 text-slate-300'
           }`}
         >
-          <span
-            aria-hidden="true"
-            className={`w-2.5 h-2.5 rounded-full shrink-0 ${
-              isConnected
-                ? 'bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.9)]'
+          <div className="flex items-center gap-3 min-w-0">
+            <span
+              aria-hidden="true"
+              className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                isConnected
+                  ? 'bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.9)]'
+                  : isConnecting
+                    ? 'bg-cyan-400 animate-pulse'
+                    : isError
+                      ? 'bg-rose-400'
+                      : signalingReady
+                        ? 'bg-cyan-400'
+                        : 'bg-amber-400 animate-pulse'
+              }`}
+            />
+            <span className="truncate">
+              {isConnected
+                ? 'متصل عبر الشبكة المحلية • P2P Direct'
                 : isConnecting
-                  ? 'bg-cyan-400 animate-pulse'
-                  : connectionState === 'error'
-                    ? 'bg-rose-400'
-                    : 'bg-slate-400'
-            }`}
-          />
-          <span className="truncate">
-            {isConnected
-              ? 'متصل عبر الشبكة المحلية • P2P Direct'
-              : isConnecting
-                ? 'جاري إنشاء القناة المباشرة...'
-                : connectionState === 'initializing'
-                  ? 'جاري تهيئة المعرّف المحلي...'
-                  : connectionState === 'error'
-                    ? 'تعذر الاتصال بخادم الإشارات'
-                    : 'جاهز للاقتران • في انتظار الجهاز الآخر'}
-          </span>
+                  ? `جاري الاقتران مع ${remotePeerId || 'الجهاز'}...`
+                  : isInitializing
+                    ? 'جاري تهيئة المعرّف على خادم الإشارات...'
+                    : isError
+                      ? 'تعذر الاتصال بخادم الإشارات'
+                      : 'جاهز للاقتران • في انتظار الجهاز الآخر'}
+            </span>
+          </div>
+
+          {isConnecting && (
+            <button
+              type="button"
+              onClick={onCancelConnect}
+              className="px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-xs font-semibold text-slate-100 shrink-0 cursor-pointer"
+            >
+              إلغاء
+            </button>
+          )}
         </div>
 
         {/* Connected Peer Details OR Local QR + Short Code */}
@@ -209,7 +282,11 @@ export function PairingPanel({
             <div className="pt-3 border-t border-white/10 flex items-center justify-between text-xs text-slate-400">
               <span>جهازك الحالي</span>
               <div className="flex items-center gap-2 text-slate-200 font-medium">
-                <DeviceIcon kind={localDevice.kind} os={localDevice.os} className="w-4 h-4 text-cyan-400" />
+                <DeviceIcon
+                  kind={localDevice.kind}
+                  os={localDevice.os}
+                  className="w-4 h-4 text-cyan-400"
+                />
                 <span>{localDevice.name}</span>
                 <span aria-hidden="true">·</span>
                 <span dir="ltr" className="font-mono-code text-slate-300">
@@ -379,7 +456,7 @@ export function PairingPanel({
             />
             <button
               type="submit"
-              disabled={!targetInput.trim() || isConnecting || connectionState === 'initializing'}
+              disabled={!targetInput.trim() || isConnecting}
               className="min-h-[44px] px-5 py-2.5 rounded-xl bg-gradient-to-l from-cyan-400 to-emerald-400 hover:from-cyan-300 hover:to-emerald-300 disabled:opacity-45 disabled:pointer-events-none text-slate-950 font-bold text-sm transition-all whitespace-nowrap shrink-0 cursor-pointer"
             >
               {isConnecting ? 'جاري الاتصال...' : 'اقتران'}
@@ -389,7 +466,7 @@ export function PairingPanel({
           {statusError && (
             <div
               role="alert"
-              className="rounded-xl bg-rose-500/10 border border-rose-400/25 px-3.5 py-2.5 text-xs text-rose-200 flex items-center justify-between gap-2"
+              className="rounded-xl bg-rose-500/10 border border-rose-400/25 px-3.5 py-2.5 text-xs text-rose-200 flex items-start justify-between gap-2 leading-relaxed"
             >
               <span>{statusError}</span>
               <button
@@ -402,6 +479,83 @@ export function PairingPanel({
               </button>
             </div>
           )}
+
+          {/* Optional Advanced TURN Relay Settings for Restricted NATs */}
+          <div className="pt-2 border-t border-white/10">
+            <button
+              type="button"
+              onClick={() => setShowTurnSettings((v) => !v)}
+              aria-expanded={showTurnSettings}
+              className="w-full flex items-center justify-between text-xs text-slate-400 hover:text-slate-200 py-1 transition-colors cursor-pointer"
+            >
+              <span className="inline-flex items-center gap-1.5">
+                <Settings2 className="w-3.5 h-3.5 text-cyan-400" aria-hidden="true" />
+                <span>إعدادات الشبكة المتقدمة (خادم TURN)</span>
+                {customTurn && (
+                  <span className="text-emerald-400 font-semibold">· مفعّل</span>
+                )}
+              </span>
+              <ChevronDown
+                className={`w-4 h-4 transition-transform ${showTurnSettings ? 'rotate-180' : ''}`}
+                aria-hidden="true"
+              />
+            </button>
+
+            {showTurnSettings && (
+              <form onSubmit={handleSaveTurn} className="mt-3 flex flex-col gap-2.5 text-xs">
+                <p className="text-slate-400 leading-relaxed">
+                  عند الاتصال عبر شبكتين مختلفتين (مثل 4G/5G مع Wi-Fi) قد يمنع الراوتر الاتصال
+                  المباشر؛ أضف خادم TURN مخصص لتجاوز جدار الحماية.
+                </p>
+                <input
+                  type="text"
+                  dir="ltr"
+                  value={turnUrls}
+                  onChange={(e) => setTurnUrls(e.target.value)}
+                  placeholder="turn:global.relay.metered.ca:80"
+                  aria-label="رابط خادم TURN"
+                  className="bg-[#050811]/80 border border-white/15 focus:border-cyan-400 rounded-xl px-3 py-2 font-mono-code text-slate-100 placeholder:text-slate-500 focus:outline-none"
+                />
+                <div className="grid grid-cols-2 gap-2">
+                  <input
+                    type="text"
+                    dir="ltr"
+                    value={turnUsername}
+                    onChange={(e) => setTurnUsername(e.target.value)}
+                    placeholder="Username"
+                    aria-label="اسم مستخدم TURN"
+                    className="bg-[#050811]/80 border border-white/15 focus:border-cyan-400 rounded-xl px-3 py-2 font-mono-code text-slate-100 placeholder:text-slate-500 focus:outline-none"
+                  />
+                  <input
+                    type="password"
+                    dir="ltr"
+                    value={turnCredential}
+                    onChange={(e) => setTurnCredential(e.target.value)}
+                    placeholder="Credential"
+                    aria-label="كلمة مرور TURN"
+                    className="bg-[#050811]/80 border border-white/15 focus:border-cyan-400 rounded-xl px-3 py-2 font-mono-code text-slate-100 placeholder:text-slate-500 focus:outline-none"
+                  />
+                </div>
+                <div className="flex items-center justify-end gap-2 pt-1">
+                  {customTurn && (
+                    <button
+                      type="button"
+                      onClick={handleResetTurn}
+                      className="px-3 py-1.5 rounded-lg text-slate-300 hover:bg-white/10 cursor-pointer"
+                    >
+                      إزالة TURN
+                    </button>
+                  )}
+                  <button
+                    type="submit"
+                    className="px-3.5 py-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/30 text-cyan-200 font-semibold cursor-pointer"
+                  >
+                    حفظ وتطبيق
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
         </div>
       )}
 
