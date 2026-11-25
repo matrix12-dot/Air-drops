@@ -16,8 +16,9 @@ export interface DeviceProfile {
 }
 
 export type ConnectionState =
-  | 'initializing'
-  | 'ready'
+  | 'idle'
+  | 'awaiting-answer'
+  | 'guest-ready'
   | 'connecting'
   | 'connected'
   | 'error';
@@ -48,7 +49,7 @@ export interface TextDropItem {
   timestamp: number;
 }
 
-export type WireMessage =
+export type ControlWireMessage =
   | {
       type: 'hello';
       device: DeviceProfile;
@@ -60,12 +61,6 @@ export type WireMessage =
       size: number;
       mimeType: string;
       totalChunks: number;
-    }
-  | {
-      type: 'file-chunk';
-      transferId: string;
-      index: number;
-      data: ArrayBuffer | Uint8Array;
     }
   | {
       type: 'file-end';
