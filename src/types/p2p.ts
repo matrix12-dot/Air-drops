@@ -16,9 +16,8 @@ export interface DeviceProfile {
 }
 
 export type ConnectionState =
-  | 'idle'
-  | 'awaiting-answer'
-  | 'guest-ready'
+  | 'initializing'
+  | 'ready'
   | 'connecting'
   | 'connected'
   | 'error';
@@ -75,4 +74,25 @@ export type ControlWireMessage =
       id: string;
       content: string;
       timestamp: number;
+    };
+
+export type MqttSignalPayload =
+  | {
+      type: 'offer';
+      from: string;
+      sdp: string;
+      device: DeviceProfile;
+    }
+  | {
+      type: 'answer';
+      from: string;
+      to: string;
+      sdp: string;
+      device: DeviceProfile;
+    }
+  | {
+      type: 'ice';
+      from: string;
+      to?: string;
+      candidate: RTCIceCandidateInit;
     };

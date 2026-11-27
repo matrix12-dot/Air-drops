@@ -25,18 +25,19 @@ export default function App() {
   };
 
   const {
+    pinCode,
     localDevice,
     connectionState,
-    offerToken,
-    answerToken,
+    mqttActive,
     remoteDevice,
     statusError,
     transfers,
     textDrops,
-    createHostOffer,
-    acceptHostOffer,
-    completeHostHandshake,
-    resetPairing,
+    connectWithPin,
+    cancelConnect,
+    disconnectPeer,
+    regeneratePin,
+    retrySignaling,
     sendFiles,
     sendTextDrop,
     updateLocalDeviceName,
@@ -57,17 +58,17 @@ export default function App() {
               جسر الملفات السريع عبر الشبكة المحلية
             </h1>
             <p className="text-sm sm:text-base text-slate-300 mt-2.5 leading-relaxed">
-              اقتران فوري عبر QR بكاميرا المتصفح ونقل مباشر للملفات والروابط على شبكة Wi-Fi
-              أو Hotspot بأقصى سرعة محلية ودون الحاجة إلى إنترنت أو خوادم وسيطة.
+              اقتران فوري خلال أقل من ثانية برمز PIN من 4 أرقام لنقل الملفات والروابط مباشرةً
+              عبر شبكة Wi-Fi أو Hotspot بأقصى سرعة محلية.
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5 text-xs text-slate-400 shrink-0">
-            <span>اتصال محلي Offline LAN</span>
+            <span>رمز PIN من 4 أرقام</span>
             <span aria-hidden="true">·</span>
             <span>حزم ثنائية 64KB</span>
             <span aria-hidden="true">·</span>
-            <span>بدون خوادم إشارة</span>
+            <span>نقل LAN مباشر 100%</span>
           </div>
         </section>
 
@@ -75,16 +76,17 @@ export default function App() {
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
           <div className="lg:col-span-4 lg:sticky lg:top-24">
             <PairingPanel
+              pinCode={pinCode}
               localDevice={localDevice}
               connectionState={connectionState}
-              offerToken={offerToken}
-              answerToken={answerToken}
+              mqttActive={mqttActive}
               remoteDevice={remoteDevice}
               statusError={statusError}
-              onCreateOffer={createHostOffer}
-              onAcceptOffer={acceptHostOffer}
-              onCompleteHandshake={completeHostHandshake}
-              onResetPairing={resetPairing}
+              onConnectWithPin={connectWithPin}
+              onCancelConnect={cancelConnect}
+              onDisconnect={disconnectPeer}
+              onRegeneratePin={regeneratePin}
+              onRetrySignaling={retrySignaling}
               onUpdateLocalName={updateLocalDeviceName}
               onClearError={clearError}
             />
@@ -110,8 +112,8 @@ export default function App() {
 
       <footer className="border-t border-white/10 py-6 mt-4">
         <div className="max-w-[1240px] mx-auto px-4 sm:px-6 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-slate-400">
-          <span>Stark AirDrop | جسر الملفات — WebRTC محلي بدون خوادم</span>
-          <span>يعمل محلياً بالكامل داخل المتصفح عبر شبكة Wi-Fi / Hotspot</span>
+          <span>Stark AirDrop | جسر الملفات — نقل محلي مباشر عبر WebRTC</span>
+          <span>تنتهي الإشارة فور الاقتران وتنتقل جميع الملفات محلياً 100%</span>
         </div>
       </footer>
     </div>

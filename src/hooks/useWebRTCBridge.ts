@@ -1,15 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import mqtt, { MqttClient } from 'mqtt';
 import {
   ConnectionState,
   ControlWireMessage,
   DeviceProfile,
   FileTransferItem,
+  MqttSignalPayload,
   TextDropItem,
 } from '../types/p2p';
-import { detectLocalDevice } from '../utils/device';
-import { decodeSignalToken, encodeSignalToken, gatherLocalSdp } from '../utils/sdpCodec';
+import {
+  deriveRoomTopic,
+  detectLocalDevice,
+  generatePinCode,
+  normalizePinCode,
+} from '../utils/device';
 import { playArrivalChime, playConnectChime, primeAudioContext } from '../utils/sound';
 
+const MQTT_BROKER_URL = 'wss://broker.emqx.io:8084/mqtt';
+const HANDSHAKE_WINDOW_MS = 5000; // Strictly 5s signaling window
 const CHUNK_SIZE = 64 * 1024; // 64KB binary chunks
 const MAX_BUFFERED_AMOUNT = 1024 * 1024; // 1MB high-water mark
 const BUFFER_LOW_THRESHOLD = 256 * 1024; // 256KB low-water mark
@@ -30,6 +38,24 @@ interface IncomingTransferBuffer {
 interface OutgoingQueuedFile {
   transferId: string;
   file: File;
+}
+
+function makeClientId(): string {
+  return `stark-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function decodeMqttPayload(payload: unknown): string {
+  if (typeof payload === 'string') return payload;
+  if (payload instanceof Uint8Array || ArrayBuffer.isView(payload)) {
+    const view = payload instanceof Uint8Array
+      ? payload
+      : new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength);
+    return new TextDecoder().decode(view);
+  }
+  if (payload instanceof ArrayBuffer) {
+    return new TextDecoder().decode(new Uint8Array(payload));
+  }
+  return String(payload ?? '');
 }
 
 function triggerBrowserDownload(blobUrl: string, fileName: string): void {
@@ -90,25 +116,34 @@ async function waitForBufferDrain(dc: RTCDataChannel): Promise<void> {
 }
 
 export function useWebRTCBridge(soundEnabled: boolean) {
+  const [pinCode, setPinCode] = useState<string>(() => generatePinCode());
   const [localDevice, setLocalDevice] = useState<DeviceProfile>(() => detectLocalDevice());
-  const [connectionState, setConnectionState] = useState<ConnectionState>('idle');
-  const [offerToken, setOfferToken] = useState<string>('');
-  const [answerToken, setAnswerToken] = useState<string>('');
+  const [connectionState, setConnectionState] = useState<ConnectionState>('initializing');
+  const [mqttActive, setMqttActive] = useState<boolean>(false);
   const [remoteDevice, setRemoteDevice] = useState<DeviceProfile | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [transfers, setTransfers] = useState<FileTransferItem[]>([]);
   const [textDrops, setTextDrops] = useState<TextDropItem[]>([]);
 
+  const hostMqttRef = useRef<MqttClient | null>(null);
+  const guestMqttRef = useRef<MqttClient | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
+
+  const clientIdRef = useRef<string>(makeClientId());
   const soundEnabledRef = useRef<boolean>(soundEnabled);
   const localDeviceRef = useRef<DeviceProfile>(localDevice);
+  const pinCodeRef = useRef<string>(pinCode);
+  const [hostGeneration, setHostGeneration] = useState<number>(0);
+
+  const pendingIceRef = useRef<RTCIceCandidateInit[]>([]);
+  const handshakeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const answerReceivedRef = useRef<boolean>(false);
 
   const activeIncomingRef = useRef<IncomingTransferBuffer | null>(null);
   const outgoingQueueRef = useRef<OutgoingQueuedFile[]>([]);
   const isSendingRef = useRef<boolean>(false);
   const blobUrlsRef = useRef<string[]>([]);
-  const connectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     soundEnabledRef.current = soundEnabled;
@@ -118,15 +153,43 @@ export function useWebRTCBridge(soundEnabled: boolean) {
     localDeviceRef.current = localDevice;
   }, [localDevice]);
 
-  const clearConnectTimeout = useCallback(() => {
-    if (connectTimeoutRef.current) {
-      clearTimeout(connectTimeoutRef.current);
-      connectTimeoutRef.current = null;
+  useEffect(() => {
+    pinCodeRef.current = pinCode;
+  }, [pinCode]);
+
+  const clearHandshakeTimer = useCallback(() => {
+    if (handshakeTimerRef.current) {
+      clearTimeout(handshakeTimerRef.current);
+      handshakeTimerRef.current = null;
     }
   }, []);
 
-  const teardownPeer = useCallback(() => {
-    clearConnectTimeout();
+  const closeMqttClient = useCallback((client: MqttClient | null) => {
+    if (!client) return;
+    try {
+      client.removeAllListeners();
+      client.end(true);
+    } catch {
+      // Ignore MQTT close errors
+    }
+  }, []);
+
+  const disconnectAllMqtt = useCallback(() => {
+    clearHandshakeTimer();
+    if (hostMqttRef.current) {
+      closeMqttClient(hostMqttRef.current);
+      hostMqttRef.current = null;
+    }
+    if (guestMqttRef.current) {
+      closeMqttClient(guestMqttRef.current);
+      guestMqttRef.current = null;
+    }
+    setMqttActive(false);
+  }, [clearHandshakeTimer, closeMqttClient]);
+
+  const teardownWebRTC = useCallback(() => {
+    pendingIceRef.current = [];
+    answerReceivedRef.current = false;
     if (dcRef.current) {
       try {
         dcRef.current.close();
@@ -144,7 +207,7 @@ export function useWebRTCBridge(soundEnabled: boolean) {
       pcRef.current = null;
     }
     activeIncomingRef.current = null;
-  }, [clearConnectTimeout]);
+  }, []);
 
   const updateTransferItem = useCallback(
     (id: string, updater: (prev: FileTransferItem) => FileTransferItem) => {
@@ -265,7 +328,6 @@ export function useWebRTCBridge(soundEnabled: boolean) {
 
   const handleDataMessage = useCallback(
     async (data: unknown) => {
-      // Control JSON messages arrive as strings; binary chunks arrive as raw ArrayBuffer
       if (typeof data === 'string') {
         let msg: ControlWireMessage;
         try {
@@ -371,7 +433,6 @@ export function useWebRTCBridge(soundEnabled: boolean) {
         return;
       }
 
-      // Raw binary chunk frame
       const bufferEntry = activeIncomingRef.current;
       if (!bufferEntry) return;
 
@@ -423,12 +484,11 @@ export function useWebRTCBridge(soundEnabled: boolean) {
       dcRef.current = dc;
 
       const onOpen = () => {
-        clearConnectTimeout();
         if (dcRef.current !== dc) return;
+        // Immediately disconnect from MQTT so 100% of file/clipboard data travels purely over LAN
+        disconnectAllMqtt();
         setConnectionState('connected');
         setStatusError(null);
-        setOfferToken('');
-        setAnswerToken('');
         playConnectChime(soundEnabledRef.current);
 
         try {
@@ -439,7 +499,7 @@ export function useWebRTCBridge(soundEnabled: boolean) {
             } satisfies ControlWireMessage)
           );
         } catch {
-          // Ignore race
+          // Ignore send race
         }
 
         void flushOutgoingQueue();
@@ -455,13 +515,11 @@ export function useWebRTCBridge(soundEnabled: boolean) {
       };
 
       dc.onclose = () => {
-        clearConnectTimeout();
         if (dcRef.current === dc) {
           dcRef.current = null;
           setRemoteDevice(null);
-          setOfferToken('');
-          setAnswerToken('');
-          setConnectionState('idle');
+          teardownWebRTC();
+          setHostGeneration((g) => g + 1);
 
           if (activeIncomingRef.current) {
             const failedId = activeIncomingRef.current.id;
@@ -476,175 +534,443 @@ export function useWebRTCBridge(soundEnabled: boolean) {
       };
 
       dc.onerror = () => {
-        clearConnectTimeout();
         if (dcRef.current === dc) {
-          setStatusError('تعذر إكمال الاتصال عبر قناة البيانات المحلية');
+          setStatusError('تعذر إكمال قناة البيانات المحلية');
         }
       };
     },
-    [clearConnectTimeout, flushOutgoingQueue, handleDataMessage, updateTransferItem]
+    [disconnectAllMqtt, flushOutgoingQueue, handleDataMessage, teardownWebRTC, updateTransferItem]
   );
 
-  const createLanPeerConnection = useCallback(() => {
-    teardownPeer();
-
-    // Empty iceServers forces 100% offline local LAN host candidates with zero internet delay
-    const pc = new RTCPeerConnection({
-      iceServers: [],
-    });
-
-    pc.oniceconnectionstatechange = () => {
-      if (pcRef.current !== pc) return;
-      if (pc.iceConnectionState === 'failed') {
-        clearConnectTimeout();
-        setStatusError(
-          'تعذر الربط المباشر عبر الشبكة المحلية. تأكد من أن الجهازين على نفس شبكة Wi-Fi أو Hotspot بدون تفعيل VPN أو عزل الأجهزة (AP Isolation).'
-        );
-        setConnectionState('error');
+  const flushPendingIce = useCallback(async (pc: RTCPeerConnection) => {
+    const queued = [...pendingIceRef.current];
+    pendingIceRef.current = [];
+    for (const candidate of queued) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch {
+        // Ignore stale candidates
       }
+    }
+  }, []);
+
+  // Device A: Host room listener for the 4-digit PIN
+  useEffect(() => {
+    let active = true;
+    let localHostClient: MqttClient | null = null;
+    let hostHandshakeTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const startHostRoom = async () => {
+      if (dcRef.current?.readyState === 'open') return;
+
+      setConnectionState('initializing');
+      const roomTopic = await deriveRoomTopic(pinCodeRef.current);
+      if (!active) return;
+
+      const client = mqtt.connect(MQTT_BROKER_URL, {
+        clientId: makeClientId(),
+        clean: true,
+        connectTimeout: 7000,
+        reconnectPeriod: 3000,
+        keepalive: 25,
+      });
+
+      localHostClient = client;
+      hostMqttRef.current = client;
+
+      client.on('connect', () => {
+        if (!active || hostMqttRef.current !== client) return;
+        client.subscribe(roomTopic, { qos: 0 }, (err) => {
+          if (!active || hostMqttRef.current !== client) return;
+          if (err) {
+            setConnectionState('error');
+            setStatusError('تعذر الاشتراك في قناة الاقتران السريع');
+            return;
+          }
+          setMqttActive(true);
+          if (!dcRef.current || dcRef.current.readyState !== 'open') {
+            setConnectionState('ready');
+          }
+        });
+      });
+
+      client.on('message', async (_topic, rawPayload) => {
+        if (!active || hostMqttRef.current !== client) return;
+        let msg: MqttSignalPayload;
+        try {
+          msg = JSON.parse(decodeMqttPayload(rawPayload)) as MqttSignalPayload;
+        } catch {
+          return;
+        }
+
+        if (msg.from === clientIdRef.current) return;
+
+        if (msg.type === 'offer') {
+          if (dcRef.current?.readyState === 'open') return;
+
+          setStatusError(null);
+          setConnectionState('connecting');
+          setRemoteDevice(msg.device);
+          teardownWebRTC();
+
+          // Enforce 5-second handshake window for Host once Offer arrives
+          if (hostHandshakeTimer) clearTimeout(hostHandshakeTimer);
+          hostHandshakeTimer = setTimeout(() => {
+            if (active && dcRef.current?.readyState !== 'open') {
+              teardownWebRTC();
+              setRemoteDevice(null);
+              setConnectionState('ready');
+              setStatusError(
+                'تعذر فتح قناة LAN المباشرة خلال 5 ثوانٍ. تأكد من اتصال الجهازين بنفس شبكة Wi-Fi أو Hotspot بدون VPN.'
+              );
+            }
+          }, HANDSHAKE_WINDOW_MS);
+
+          const pc = new RTCPeerConnection({ iceServers: [] });
+          pcRef.current = pc;
+
+          pc.ondatachannel = (event) => {
+            attachDataChannel(event.channel);
+          };
+
+          pc.onicecandidate = (event) => {
+            if (event.candidate && client.connected) {
+              client.publish(
+                roomTopic,
+                JSON.stringify({
+                  type: 'ice',
+                  from: clientIdRef.current,
+                  to: msg.from,
+                  candidate: event.candidate.toJSON(),
+                } satisfies MqttSignalPayload)
+              );
+            }
+          };
+
+          pc.oniceconnectionstatechange = () => {
+            if (pcRef.current !== pc) return;
+            if (pc.iceConnectionState === 'failed') {
+              if (hostHandshakeTimer) clearTimeout(hostHandshakeTimer);
+              teardownWebRTC();
+              setRemoteDevice(null);
+              setConnectionState('ready');
+              setStatusError(
+                'فشل الاتصال المباشر عبر الشبكة المحلية (LAN). تحقق من عدم تفعيل عزل الأجهزة أو VPN.'
+              );
+            }
+          };
+
+          try {
+            await pc.setRemoteDescription(
+              new RTCSessionDescription({ type: 'offer', sdp: msg.sdp })
+            );
+            await flushPendingIce(pc);
+
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+
+            if (client.connected && pc.localDescription?.sdp) {
+              client.publish(
+                roomTopic,
+                JSON.stringify({
+                  type: 'answer',
+                  from: clientIdRef.current,
+                  to: msg.from,
+                  sdp: pc.localDescription.sdp,
+                  device: localDeviceRef.current,
+                } satisfies MqttSignalPayload)
+              );
+            }
+          } catch {
+            if (hostHandshakeTimer) clearTimeout(hostHandshakeTimer);
+            teardownWebRTC();
+            setConnectionState('ready');
+            setStatusError('حدث خطأ أثناء معالجة طلب الاقتران');
+          }
+        } else if (msg.type === 'ice') {
+          if (msg.to && msg.to !== clientIdRef.current) return;
+          const pc = pcRef.current;
+          if (pc && pc.remoteDescription) {
+            try {
+              await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+            } catch {
+              // Ignore stale ICE
+            }
+          } else {
+            pendingIceRef.current.push(msg.candidate);
+          }
+        }
+      });
+
+      client.on('error', () => {
+        if (!active || hostMqttRef.current !== client) return;
+        if (!dcRef.current || dcRef.current.readyState !== 'open') {
+          setMqttActive(false);
+          setConnectionState('error');
+          setStatusError('تعذر الوصول إلى وسيط الإشارة (EMQX). تحقق من الاتصال ثم أعد المحاولة.');
+        }
+      });
     };
 
-    pcRef.current = pc;
-    return pc;
-  }, [clearConnectTimeout, teardownPeer]);
+    void startHostRoom();
 
-  // Step 1 (Host): Create Offer QR instantaneously (<50ms)
-  const createHostOffer = useCallback(async () => {
-    primeAudioContext();
-    setStatusError(null);
-    setAnswerToken('');
-    setRemoteDevice(null);
-
-    try {
-      const pc = createLanPeerConnection();
-      const dc = pc.createDataChannel('stark-bridge', { ordered: true });
-      attachDataChannel(dc);
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-
-      const fullLocalSdp = await gatherLocalSdp(pc);
-      const token = encodeSignalToken('offer', fullLocalSdp);
-
-      setOfferToken(token);
-      setConnectionState('awaiting-answer');
-    } catch {
-      setStatusError('تعذر إنشاء رمز الاتصال السريع. تأكد من دعم المتصفح لـ WebRTC.');
-      setConnectionState('error');
-    }
-  }, [attachDataChannel, createLanPeerConnection]);
-
-  // Step 2 (Guest): Scan/Paste Host Offer -> immediately produce Answer QR
-  const acceptHostOffer = useCallback(
-    async (rawToken: string): Promise<boolean> => {
-      primeAudioContext();
-      const decoded = decodeSignalToken(rawToken);
-      if (!decoded) {
-        setStatusError('الرمز المقروء غير صالح. تأكد من مسح رمز العرض الصحيح.');
-        return false;
+    return () => {
+      active = false;
+      if (hostHandshakeTimer) clearTimeout(hostHandshakeTimer);
+      if (hostMqttRef.current === localHostClient) {
+        closeMqttClient(localHostClient);
+        hostMqttRef.current = null;
+      } else {
+        closeMqttClient(localHostClient);
       }
-      if (decoded.kind !== 'offer') {
-        setStatusError('هذا رمز استجابة (Answer) وليس رمز عرض (Offer). امسح الرمز من الجهاز المُنشئ للاتصال.');
-        return false;
-      }
-
-      setStatusError(null);
-      setOfferToken('');
-      setRemoteDevice(null);
-
-      try {
-        const pc = createLanPeerConnection();
-        pc.ondatachannel = (event) => {
-          attachDataChannel(event.channel);
-        };
-
-        await pc.setRemoteDescription(
-          new RTCSessionDescription({ type: 'offer', sdp: decoded.sdp })
-        );
-
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-
-        const fullLocalSdp = await gatherLocalSdp(pc);
-        const token = encodeSignalToken('answer', fullLocalSdp);
-
-        setAnswerToken(token);
-        setConnectionState('guest-ready');
-        return true;
-      } catch {
-        setStatusError('تعذر معالجة رمز الاتصال. أنشئ اتصالاً جديداً وحاول مجدداً.');
-        setConnectionState('error');
-        return false;
-      }
-    },
-    [attachDataChannel, createLanPeerConnection]
-  );
-
-  // Step 3 (Host): Scan/Paste Guest Answer -> instantaneous LAN DataChannel lock
-  const completeHostHandshake = useCallback(
-    async (rawToken: string): Promise<boolean> => {
-      primeAudioContext();
-      const decoded = decodeSignalToken(rawToken);
-      if (!decoded) {
-        setStatusError('رمز الاستجابة غير صالح. تأكد من مسح رمز QR الظاهر على الجهاز الآخر.');
-        return false;
-      }
-      if (decoded.kind !== 'answer') {
-        setStatusError('هذا رمز عرض (Offer) وليس رمز استجابة (Answer). امسح الرمز الجديد من شاشة الجهاز الثاني.');
-        return false;
-      }
-
-      const pc = pcRef.current;
-      if (!pc || pc.signalingState === 'closed') {
-        setStatusError('انتهت صلاحية الجلسة الحالية. أنشئ اتصالاً سريعاً جديداً.');
-        setConnectionState('idle');
-        return false;
-      }
-
-      try {
-        setStatusError(null);
-        setConnectionState('connecting');
-
-        await pc.setRemoteDescription(
-          new RTCSessionDescription({ type: 'answer', sdp: decoded.sdp })
-        );
-
-        clearConnectTimeout();
-        connectTimeoutRef.current = setTimeout(() => {
-          if (dcRef.current?.readyState !== 'open') {
-            setStatusError(
-              'لم تكتمل قناة الشبكة المحلية (LAN). تأكد من اتصال الجهازين بنفس شبكة Wi-Fi/Hotspot وإيقاف أي VPN، ثم أعد المحاولة.'
-            );
-            setConnectionState('awaiting-answer');
-          }
-        }, 8000);
-
-        return true;
-      } catch {
-        setStatusError('تعذر إتمام المصافحة المباشرة. تأكد من أن رمز الاستجابة يطابق رمز العرض الحالي.');
-        setConnectionState('awaiting-answer');
-        return false;
-      }
-    },
-    [clearConnectTimeout]
-  );
-
-  const resetPairing = useCallback(() => {
-    teardownPeer();
-    setOfferToken('');
-    setAnswerToken('');
-    setRemoteDevice(null);
-    setStatusError(null);
-    setConnectionState('idle');
-  }, [teardownPeer]);
+    };
+  }, [
+    attachDataChannel,
+    closeMqttClient,
+    flushPendingIce,
+    hostGeneration,
+    pinCode,
+    teardownWebRTC,
+  ]);
 
   useEffect(() => {
     return () => {
-      teardownPeer();
+      disconnectAllMqtt();
+      teardownWebRTC();
       blobUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
       blobUrlsRef.current = [];
     };
-  }, [teardownPeer]);
+  }, [disconnectAllMqtt, teardownWebRTC]);
+
+  // Device B: Connect to Host's 4-digit PIN room for max 5 seconds
+  const connectWithPin = useCallback(
+    async (rawPin: string) => {
+      primeAudioContext();
+      const cleanPin = normalizePinCode(rawPin);
+      if (cleanPin.length !== 4) {
+        setStatusError('يرجى إدخال رمز PIN مكوّن من 4 أرقام');
+        return;
+      }
+      if (cleanPin === pinCodeRef.current) {
+        setStatusError('لا يمكنك الاتصال برمز نفس الجهاز. أدخل الرمز الظاهر على الجهاز الآخر.');
+        return;
+      }
+
+      // Close host listener while dialing out as Guest
+      if (hostMqttRef.current) {
+        closeMqttClient(hostMqttRef.current);
+        hostMqttRef.current = null;
+      }
+      if (guestMqttRef.current) {
+        closeMqttClient(guestMqttRef.current);
+        guestMqttRef.current = null;
+      }
+      clearHandshakeTimer();
+      teardownWebRTC();
+
+      setStatusError(null);
+      setRemoteDevice(null);
+      setConnectionState('connecting');
+      setMqttActive(true);
+
+      const roomTopic = await deriveRoomTopic(cleanPin);
+      const guestClient = mqtt.connect(MQTT_BROKER_URL, {
+        clientId: makeClientId(),
+        clean: true,
+        connectTimeout: 4500,
+        reconnectPeriod: 0,
+        keepalive: 15,
+      });
+
+      guestMqttRef.current = guestClient;
+      answerReceivedRef.current = false;
+
+      // Strict 5-second signaling window on MQTT
+      handshakeTimerRef.current = setTimeout(() => {
+        if (dcRef.current?.readyState === 'open') return;
+        closeMqttClient(guestClient);
+        if (guestMqttRef.current === guestClient) {
+          guestMqttRef.current = null;
+        }
+        setMqttActive(false);
+        teardownWebRTC();
+        setRemoteDevice(null);
+        setStatusError(
+          answerReceivedRef.current
+            ? 'تعذر إكمال الربط المباشر عبر الشبكة المحلية خلال 5 ثوانٍ. تأكد من أن الجهازين على نفس شبكة Wi-Fi/Hotspot بدون VPN.'
+            : `لم يتم العثور على جهاز ينتظر بالرمز ${cleanPin} خلال 5 ثوانٍ. تأكد من صحة الرمز.`
+        );
+        // Re-enable own Host room so user stays ready
+        setHostGeneration((g) => g + 1);
+      }, HANDSHAKE_WINDOW_MS);
+
+      guestClient.on('connect', () => {
+        if (guestMqttRef.current !== guestClient) return;
+        guestClient.subscribe(roomTopic, { qos: 0 }, async (err) => {
+          if (err || guestMqttRef.current !== guestClient) {
+            clearHandshakeTimer();
+            closeMqttClient(guestClient);
+            guestMqttRef.current = null;
+            setMqttActive(false);
+            setStatusError('تعذر الاشتراك في غرفة الاقتران');
+            setHostGeneration((g) => g + 1);
+            return;
+          }
+
+          const pc = new RTCPeerConnection({ iceServers: [] });
+          pcRef.current = pc;
+
+          const dc = pc.createDataChannel('stark-bridge', { ordered: true });
+          attachDataChannel(dc);
+
+          pc.onicecandidate = (event) => {
+            if (event.candidate && guestClient.connected) {
+              guestClient.publish(
+                roomTopic,
+                JSON.stringify({
+                  type: 'ice',
+                  from: clientIdRef.current,
+                  candidate: event.candidate.toJSON(),
+                } satisfies MqttSignalPayload)
+              );
+            }
+          };
+
+          pc.oniceconnectionstatechange = () => {
+            if (pcRef.current !== pc) return;
+            if (pc.iceConnectionState === 'failed') {
+              clearHandshakeTimer();
+              closeMqttClient(guestClient);
+              guestMqttRef.current = null;
+              setMqttActive(false);
+              teardownWebRTC();
+              setRemoteDevice(null);
+              setStatusError(
+                'فشل التفاوض الشبكي المباشر (LAN). تأكد من اتصال الجهازين بنفس الشبكة بدون عزل أو VPN.'
+              );
+              setHostGeneration((g) => g + 1);
+            }
+          };
+
+          try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+
+            if (guestClient.connected && pc.localDescription?.sdp) {
+              guestClient.publish(
+                roomTopic,
+                JSON.stringify({
+                  type: 'offer',
+                  from: clientIdRef.current,
+                  sdp: pc.localDescription.sdp,
+                  device: localDeviceRef.current,
+                } satisfies MqttSignalPayload)
+              );
+            }
+          } catch {
+            clearHandshakeTimer();
+            closeMqttClient(guestClient);
+            guestMqttRef.current = null;
+            setMqttActive(false);
+            teardownWebRTC();
+            setStatusError('تعذر إنشاء اتصال WebRTC المحلي');
+            setHostGeneration((g) => g + 1);
+          }
+        });
+      });
+
+      guestClient.on('message', async (_topic, rawPayload) => {
+        if (guestMqttRef.current !== guestClient) return;
+        let msg: MqttSignalPayload;
+        try {
+          msg = JSON.parse(decodeMqttPayload(rawPayload)) as MqttSignalPayload;
+        } catch {
+          return;
+        }
+
+        if (msg.from === clientIdRef.current) return;
+
+        if (msg.type === 'answer' && msg.to === clientIdRef.current) {
+          answerReceivedRef.current = true;
+          setRemoteDevice(msg.device);
+          const pc = pcRef.current;
+          if (!pc) return;
+          try {
+            await pc.setRemoteDescription(
+              new RTCSessionDescription({ type: 'answer', sdp: msg.sdp })
+            );
+            await flushPendingIce(pc);
+          } catch {
+            // Ignore SDP race
+          }
+        } else if (msg.type === 'ice') {
+          if (msg.to && msg.to !== clientIdRef.current) return;
+          const pc = pcRef.current;
+          if (pc && pc.remoteDescription) {
+            try {
+              await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+            } catch {
+              // Ignore
+            }
+          } else {
+            pendingIceRef.current.push(msg.candidate);
+          }
+        }
+      });
+
+      guestClient.on('error', () => {
+        if (guestMqttRef.current !== guestClient) return;
+        clearHandshakeTimer();
+        closeMqttClient(guestClient);
+        guestMqttRef.current = null;
+        setMqttActive(false);
+        teardownWebRTC();
+        setStatusError('تعذر الاتصال بخادم الإشارة السريع (EMQX)');
+        setHostGeneration((g) => g + 1);
+      });
+    },
+    [
+      attachDataChannel,
+      clearHandshakeTimer,
+      closeMqttClient,
+      flushPendingIce,
+      teardownWebRTC,
+    ]
+  );
+
+  const cancelConnect = useCallback(() => {
+    clearHandshakeTimer();
+    if (guestMqttRef.current) {
+      closeMqttClient(guestMqttRef.current);
+      guestMqttRef.current = null;
+    }
+    setMqttActive(false);
+    teardownWebRTC();
+    setRemoteDevice(null);
+    setStatusError(null);
+    setHostGeneration((g) => g + 1);
+  }, [clearHandshakeTimer, closeMqttClient, teardownWebRTC]);
+
+  const disconnectPeer = useCallback(() => {
+    disconnectAllMqtt();
+    teardownWebRTC();
+    setRemoteDevice(null);
+    setStatusError(null);
+    setHostGeneration((g) => g + 1);
+  }, [disconnectAllMqtt, teardownWebRTC]);
+
+  const regeneratePin = useCallback(() => {
+    disconnectAllMqtt();
+    teardownWebRTC();
+    setRemoteDevice(null);
+    setStatusError(null);
+    setPinCode(generatePinCode());
+  }, [disconnectAllMqtt, teardownWebRTC]);
+
+  const retrySignaling = useCallback(() => {
+    setStatusError(null);
+    setHostGeneration((g) => g + 1);
+  }, []);
 
   const sendFiles = useCallback(
     (files: FileList | File[]) => {
@@ -761,18 +1087,19 @@ export function useWebRTCBridge(soundEnabled: boolean) {
   }, []);
 
   return {
+    pinCode,
     localDevice,
     connectionState,
-    offerToken,
-    answerToken,
+    mqttActive,
     remoteDevice,
     statusError,
     transfers,
     textDrops,
-    createHostOffer,
-    acceptHostOffer,
-    completeHostHandshake,
-    resetPairing,
+    connectWithPin,
+    cancelConnect,
+    disconnectPeer,
+    regeneratePin,
+    retrySignaling,
     sendFiles,
     sendTextDrop,
     updateLocalDeviceName,

@@ -1,100 +1,56 @@
 import { DeviceKind, DeviceProfile, OperatingSystem } from '../types/p2p';
 
-// Exclude easily confused characters (0, O, 1, I, L) for fast manual typing
-const CODE_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
-
-export function generateStarkId(): string {
-  const randomValues = new Uint8Array(3);
+export function generatePinCode(): string {
+  const arr = new Uint32Array(1);
   if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
-    crypto.getRandomValues(randomValues);
+    crypto.getRandomValues(arr);
   } else {
-    for (let i = 0; i < 3; i++) {
-      randomValues[i] = Math.floor(Math.random() * 256);
-    }
+    arr[0] = Math.floor(Math.random() * 9000);
   }
-  let suffix = '';
-  for (let i = 0; i < 3; i++) {
-    suffix += CODE_ALPHABET[randomValues[i] % CODE_ALPHABET.length];
-  }
-  return `STARK-${suffix}`;
+  const num = 1000 + (arr[0] % 9000);
+  return String(num);
 }
 
-export function normalizePeerId(raw: string): string {
-  const trimmed = raw.replace(/[\u200B-\u200F\uFEFF]/g, '').trim();
-  if (!trimmed) return '';
-
-  // Support pasting a full ?connect=STARK-XXX URL
-  if (trimmed.includes('connect=')) {
-    try {
-      const url = new URL(trimmed.startsWith('http') ? trimmed : `https://local.app/${trimmed}`);
-      const param = url.searchParams.get('connect');
-      if (param) {
-        return normalizePeerId(param);
-      }
-    } catch {
-      const match = trimmed.match(/connect=([A-Za-z0-9_-]+)/i);
-      if (match?.[1]) {
-        return normalizePeerId(match[1]);
-      }
-    }
-  }
-
-  const normalizedDashes = trimmed.replace(/[–—−ـ]/g, '-');
-  const upper = normalizedDashes.toUpperCase().replace(/\s+/g, '');
-  if (upper.startsWith('STARK-')) {
-    return upper;
-  }
-  if (upper.startsWith('STARK') && upper.length > 5) {
-    return `STARK-${upper.slice(5).replace(/^-+/, '')}`;
-  }
-  // If user typed just the short 3-5 char suffix (e.g. "94X"), prepend STARK-
-  if (/^[A-Z0-9]{3,5}$/.test(upper)) {
-    return `STARK-${upper}`;
-  }
-  return upper;
+// Convert Arabic-Indic / Eastern Arabic numerals to ASCII digits and strip non-digits
+export function normalizePinCode(raw: string): string {
+  const ascii = raw
+    .replace(/[٠-٩]/g, (d) => String(d.charCodeAt(0) - 0x0660))
+    .replace(/[۰-۹]/g, (d) => String(d.charCodeAt(0) - 0x06f0));
+  return ascii.replace(/\D/g, '').slice(0, 4);
 }
 
-export interface CustomTurnConfig {
-  urls: string;
-  username: string;
-  credential: string;
-}
-
-const TURN_STORAGE_KEY = 'stark_custom_turn_config';
-
-export function loadCustomTurnConfig(): CustomTurnConfig | null {
-  if (typeof localStorage === 'undefined') return null;
-  try {
-    const raw = localStorage.getItem(TURN_STORAGE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<CustomTurnConfig>;
-    if (parsed.urls && parsed.urls.trim()) {
-      return {
-        urls: parsed.urls.trim(),
-        username: (parsed.username || '').trim(),
-        credential: (parsed.credential || '').trim(),
-      };
-    }
-  } catch {
-    // Ignore malformed JSON
+function fallbackHash(input: string): string {
+  let h1 = 0xdeadbeef ^ input.length;
+  let h2 = 0x41c6ce57 ^ input.length;
+  for (let i = 0; i < input.length; i++) {
+    const ch = input.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
   }
-  return null;
-}
-
-export function saveCustomTurnConfig(config: CustomTurnConfig | null): void {
-  if (typeof localStorage === 'undefined') return;
-  if (!config || !config.urls.trim()) {
-    localStorage.removeItem(TURN_STORAGE_KEY);
-    return;
-  }
-  localStorage.setItem(
-    TURN_STORAGE_KEY,
-    JSON.stringify({
-      urls: config.urls.trim(),
-      username: config.username.trim(),
-      credential: config.credential.trim(),
-    })
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (
+    (h2 >>> 0).toString(16).padStart(8, '0') + (h1 >>> 0).toString(16).padStart(8, '0')
   );
+}
+
+export async function deriveRoomTopic(pin: string): Promise<string> {
+  const cleanPin = normalizePinCode(pin);
+  const salted = `stark-lan-drop-room-v1:${cleanPin}`;
+
+  if (typeof crypto !== 'undefined' && crypto.subtle) {
+    try {
+      const encoded = new TextEncoder().encode(salted);
+      const digest = await crypto.subtle.digest('SHA-256', encoded);
+      const bytes = Array.from(new Uint8Array(digest));
+      const hex = bytes.map((b) => b.toString(16).padStart(2, '0')).join('');
+      return `stark-lan-drop/room-${hex.slice(0, 20)}`;
+    } catch {
+      // Fallback below
+    }
+  }
+
+  return `stark-lan-drop/room-${fallbackHash(salted)}`;
 }
 
 export function detectLocalDevice(): DeviceProfile {
@@ -107,7 +63,10 @@ export function detectLocalDevice(): DeviceProfile {
   if (/iPhone|iPod/i.test(ua)) {
     os = 'iOS';
     kind = 'mobile';
-  } else if (/iPad/i.test(ua) || (/Mac/i.test(platform) && typeof navigator !== 'undefined' && navigator.maxTouchPoints > 1)) {
+  } else if (
+    /iPad/i.test(ua) ||
+    (/Mac/i.test(platform) && typeof navigator !== 'undefined' && navigator.maxTouchPoints > 1)
+  ) {
     os = 'iOS';
     kind = 'tablet';
   } else if (/Android/i.test(ua)) {

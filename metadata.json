@@ -1,6 +1,6 @@
 {
   "name": "Stark AirDrop | جسر الملفات",
-  "description": "تطبيق مشاركة ملفات ونصوص فائق السرعة عبر الشبكة المحلية (P2P LAN) باستخدام WebRTC بدون إنترنت أو خوادم وسيطة.",
-  "requestFramePermissions": ["camera"],
+  "description": "تطبيق مشاركة ملفات ونصوص فائق السرعة عبر الشبكة المحلية (P2P LAN) باستخدام WebRTC وإشارة MQTT السريعة برمز PIN من 4 أرقام.",
+  "requestFramePermissions": [],
   "majorCapabilities": []
 }
