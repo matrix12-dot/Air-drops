@@ -22,6 +22,14 @@ export type ConnectionState =
   | 'connected'
   | 'error';
 
+export interface IceDiagnostics {
+  mode: 'lan-direct' | 'relayed' | 'unknown';
+  label: string;
+  protocol?: string;
+  localAddress?: string;
+  remoteAddress?: string;
+}
+
 export type TransferDirection = 'send' | 'receive';
 
 export type TransferStatus = 'queued' | 'transferring' | 'completed' | 'error';

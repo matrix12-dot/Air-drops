@@ -5,6 +5,7 @@ import {
   ControlWireMessage,
   DeviceProfile,
   FileTransferItem,
+  IceDiagnostics,
   MqttSignalPayload,
   TextDropItem,
 } from '../types/p2p';
@@ -18,9 +19,9 @@ import { playArrivalChime, playConnectChime, primeAudioContext } from '../utils/
 
 const MQTT_BROKER_URL = 'wss://broker.emqx.io:8084/mqtt';
 const HANDSHAKE_WINDOW_MS = 5000; // Strictly 5s signaling window
-const CHUNK_SIZE = 64 * 1024; // 64KB binary chunks
-const MAX_BUFFERED_AMOUNT = 1024 * 1024; // 1MB high-water mark
-const BUFFER_LOW_THRESHOLD = 256 * 1024; // 256KB low-water mark
+const CHUNK_SIZE = 262144; // 256KB binary chunks
+const MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024; // 8MB high-water mark
+const BUFFER_LOW_THRESHOLD = 1048576; // 1MB low-water mark (native bufferedamountlow)
 
 interface IncomingTransferBuffer {
   id: string;
@@ -87,32 +88,108 @@ async function toUint8Array(payload: unknown): Promise<Uint8Array> {
   return new Uint8Array(0);
 }
 
-async function waitForBufferDrain(dc: RTCDataChannel): Promise<void> {
-  if (dc.bufferedAmount <= MAX_BUFFERED_AMOUNT) {
-    return;
+function waitForBufferDrain(dc: RTCDataChannel): Promise<void> {
+  if (dc.bufferedAmount < MAX_BUFFERED_AMOUNT || dc.readyState !== 'open') {
+    return Promise.resolve();
   }
 
-  await new Promise<void>((resolve) => {
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      dc.removeEventListener('bufferedamountlow', onLow);
-      clearTimeout(timer);
+  return new Promise<void>((resolve) => {
+    const cleanup = () => {
+      dc.removeEventListener('bufferedamountlow', onDrain);
+      dc.removeEventListener('close', onDrain);
+      dc.removeEventListener('error', onDrain);
+    };
+
+    const onDrain = () => {
+      cleanup();
       resolve();
     };
 
-    const onLow = () => finish();
+    dc.bufferedAmountLowThreshold = BUFFER_LOW_THRESHOLD;
+    dc.addEventListener('bufferedamountlow', onDrain, { once: true });
+    dc.addEventListener('close', onDrain, { once: true });
+    dc.addEventListener('error', onDrain, { once: true });
 
-    try {
-      dc.bufferedAmountLowThreshold = BUFFER_LOW_THRESHOLD;
-      dc.addEventListener('bufferedamountlow', onLow);
-    } catch {
-      // Fallback to timer only
+    // Re-check synchronously in case bufferedAmount dropped below threshold before listener attached
+    if (dc.bufferedAmount <= BUFFER_LOW_THRESHOLD || dc.readyState !== 'open') {
+      cleanup();
+      resolve();
+    }
+  });
+}
+
+async function inspectActiveIcePair(pc: RTCPeerConnection): Promise<IceDiagnostics> {
+  try {
+    const stats = await pc.getStats();
+    let selectedPairId: string | undefined;
+    let fallbackPair: Record<string, unknown> | null = null;
+
+    stats.forEach((report) => {
+      const r = report as unknown as Record<string, unknown>;
+      if (r.type === 'transport' && typeof r.selectedCandidatePairId === 'string') {
+        selectedPairId = r.selectedCandidatePairId;
+      }
+      if (
+        r.type === 'candidate-pair' &&
+        (r.nominated === true || r.state === 'succeeded')
+      ) {
+        fallbackPair = r;
+      }
+    });
+
+    const pair =
+      (selectedPairId
+        ? (stats.get(selectedPairId) as unknown as Record<string, unknown> | undefined)
+        : undefined) || fallbackPair;
+
+    if (!pair) {
+      return { mode: 'unknown', label: 'P2P Active' };
     }
 
-    const timer = setTimeout(finish, 30);
-  });
+    const localCandidate =
+      typeof pair.localCandidateId === 'string'
+        ? (stats.get(pair.localCandidateId) as unknown as Record<string, unknown> | undefined)
+        : undefined;
+    const remoteCandidate =
+      typeof pair.remoteCandidateId === 'string'
+        ? (stats.get(pair.remoteCandidateId) as unknown as Record<string, unknown> | undefined)
+        : undefined;
+
+    const localType = String(localCandidate?.candidateType || '');
+    const remoteType = String(remoteCandidate?.candidateType || '');
+    const protocol = String(
+      remoteCandidate?.protocol || localCandidate?.protocol || 'udp'
+    ).toUpperCase();
+    const remoteAddress = String(remoteCandidate?.address || remoteCandidate?.ip || '');
+    const localAddress = String(localCandidate?.address || localCandidate?.ip || '');
+
+    if (localType === 'relay' || remoteType === 'relay') {
+      return {
+        mode: 'relayed',
+        label: remoteAddress ? `Relayed (${remoteAddress})` : 'Relayed',
+        protocol,
+        localAddress,
+        remoteAddress,
+      };
+    }
+
+    const displayAddress = remoteAddress || localAddress;
+    const formattedAddress = displayAddress
+      ? displayAddress.endsWith('.local')
+        ? 'mDNS .local'
+        : displayAddress
+      : 'Local LAN';
+
+    return {
+      mode: 'lan-direct',
+      label: `LAN Direct (${formattedAddress})`,
+      protocol,
+      localAddress,
+      remoteAddress,
+    };
+  } catch {
+    return { mode: 'unknown', label: 'LAN Direct' };
+  }
 }
 
 export function useWebRTCBridge(soundEnabled: boolean) {
@@ -121,6 +198,7 @@ export function useWebRTCBridge(soundEnabled: boolean) {
   const [connectionState, setConnectionState] = useState<ConnectionState>('initializing');
   const [mqttActive, setMqttActive] = useState<boolean>(false);
   const [remoteDevice, setRemoteDevice] = useState<DeviceProfile | null>(null);
+  const [iceDiagnostics, setIceDiagnostics] = useState<IceDiagnostics | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [transfers, setTransfers] = useState<FileTransferItem[]>([]);
   const [textDrops, setTextDrops] = useState<TextDropItem[]>([]);
@@ -190,6 +268,7 @@ export function useWebRTCBridge(soundEnabled: boolean) {
   const teardownWebRTC = useCallback(() => {
     pendingIceRef.current = [];
     answerReceivedRef.current = false;
+    setIceDiagnostics(null);
     if (dcRef.current) {
       try {
         dcRef.current.close();
@@ -234,7 +313,13 @@ export function useWebRTCBridge(soundEnabled: boolean) {
         if (!nextItem) continue;
 
         const { transferId, file } = nextItem;
-        const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+        const maxSctpMessage = pcRef.current?.sctp?.maxMessageSize;
+        const effectiveChunkSize =
+          maxSctpMessage && maxSctpMessage >= 16384
+            ? Math.min(CHUNK_SIZE, maxSctpMessage)
+            : CHUNK_SIZE;
+
+        const totalChunks = Math.max(1, Math.ceil(file.size / effectiveChunkSize));
         const startedAt = performance.now();
         let lastUiUpdate = startedAt;
         let lastBytes = 0;
@@ -247,6 +332,8 @@ export function useWebRTCBridge(soundEnabled: boolean) {
         }));
 
         try {
+          activeDc.bufferedAmountLowThreshold = BUFFER_LOW_THRESHOLD;
+
           activeDc.send(
             JSON.stringify({
               type: 'file-start',
@@ -259,19 +346,35 @@ export function useWebRTCBridge(soundEnabled: boolean) {
           );
 
           let offset = 0;
+          let nextSlicePromise: Promise<ArrayBuffer> | null =
+            file.size > 0
+              ? file.slice(0, Math.min(effectiveChunkSize, file.size)).arrayBuffer()
+              : null;
 
-          while (offset < file.size) {
+          while (nextSlicePromise) {
+            const buffer = await nextSlicePromise;
+
             if (activeDc.readyState !== 'open') {
               throw new Error('انقطع الاتصال أثناء الإرسال');
             }
 
-            await waitForBufferDrain(activeDc);
+            const nextOffset = offset + buffer.byteLength;
+            nextSlicePromise =
+              nextOffset < file.size
+                ? file
+                    .slice(nextOffset, Math.min(nextOffset + effectiveChunkSize, file.size))
+                    .arrayBuffer()
+                : null;
 
-            const slice = file.slice(offset, offset + CHUNK_SIZE);
-            const buffer = await slice.arrayBuffer();
+            if (activeDc.bufferedAmount >= MAX_BUFFERED_AMOUNT) {
+              await waitForBufferDrain(activeDc);
+              if (activeDc.readyState !== 'open') {
+                throw new Error('انقطع الاتصال أثناء الإرسال');
+              }
+            }
+
             activeDc.send(buffer);
-
-            offset += buffer.byteLength;
+            offset = nextOffset;
 
             const now = performance.now();
             if (now - lastUiUpdate >= 100 || offset >= file.size) {
@@ -436,11 +539,22 @@ export function useWebRTCBridge(soundEnabled: boolean) {
       const bufferEntry = activeIncomingRef.current;
       if (!bufferEntry) return;
 
-      const bytes = await toUint8Array(data);
-      if (bytes.byteLength === 0) return;
+      let chunkPart: BlobPart;
+      let byteLength = 0;
 
-      bufferEntry.chunks.push(bytes as unknown as BlobPart);
-      bufferEntry.bytesReceived += bytes.byteLength;
+      if (data instanceof ArrayBuffer) {
+        chunkPart = data;
+        byteLength = data.byteLength;
+      } else {
+        const bytes = await toUint8Array(data);
+        chunkPart = bytes as unknown as BlobPart;
+        byteLength = bytes.byteLength;
+      }
+
+      if (byteLength === 0) return;
+
+      bufferEntry.chunks.push(chunkPart);
+      bufferEntry.bytesReceived += byteLength;
 
       const now = performance.now();
       if (
@@ -481,7 +595,18 @@ export function useWebRTCBridge(soundEnabled: boolean) {
   const attachDataChannel = useCallback(
     (dc: RTCDataChannel) => {
       dc.binaryType = 'arraybuffer';
+      dc.bufferedAmountLowThreshold = BUFFER_LOW_THRESHOLD;
       dcRef.current = dc;
+
+      const refreshDiagnostics = () => {
+        const activePc = pcRef.current;
+        if (!activePc) return;
+        void inspectActiveIcePair(activePc).then((diag) => {
+          if (pcRef.current === activePc) {
+            setIceDiagnostics(diag);
+          }
+        });
+      };
 
       const onOpen = () => {
         if (dcRef.current !== dc) return;
@@ -490,6 +615,8 @@ export function useWebRTCBridge(soundEnabled: boolean) {
         setConnectionState('connected');
         setStatusError(null);
         playConnectChime(soundEnabledRef.current);
+        refreshDiagnostics();
+        setTimeout(refreshDiagnostics, 400);
 
         try {
           dc.send(
@@ -1092,6 +1219,7 @@ export function useWebRTCBridge(soundEnabled: boolean) {
     connectionState,
     mqttActive,
     remoteDevice,
+    iceDiagnostics,
     statusError,
     transfers,
     textDrops,

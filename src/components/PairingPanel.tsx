@@ -11,7 +11,7 @@ import {
   Wifi,
   X,
 } from 'lucide-react';
-import { ConnectionState, DeviceProfile } from '../types/p2p';
+import { ConnectionState, DeviceProfile, IceDiagnostics } from '../types/p2p';
 import { normalizePinCode } from '../utils/device';
 import { DeviceIcon } from './DeviceIcon';
 
@@ -21,6 +21,7 @@ interface PairingPanelProps {
   connectionState: ConnectionState;
   mqttActive: boolean;
   remoteDevice: DeviceProfile | null;
+  iceDiagnostics: IceDiagnostics | null;
   statusError: string | null;
   onConnectWithPin: (pin: string) => Promise<void>;
   onCancelConnect: () => void;
@@ -37,6 +38,7 @@ export function PairingPanel({
   connectionState,
   mqttActive,
   remoteDevice,
+  iceDiagnostics,
   statusError,
   onConnectWithPin,
   onCancelConnect,
@@ -221,15 +223,41 @@ export function PairingPanel({
               </div>
             </div>
 
-            <div className="pt-3 border-t border-white/10 flex items-center justify-between text-xs text-slate-400">
-              <span>جهازك الحالي</span>
-              <div className="flex items-center gap-2 text-slate-200 font-medium">
-                <DeviceIcon
-                  kind={localDevice.kind}
-                  os={localDevice.os}
-                  className="w-4 h-4 text-cyan-400"
-                />
-                <span>{localDevice.name}</span>
+            <div className="pt-3 border-t border-white/10 flex flex-col gap-2.5 text-xs">
+              <div className="flex items-center justify-between text-slate-400">
+                <span>مسار الاتصال (ICE)</span>
+                <div className="flex items-center gap-2 font-mono-code">
+                  <span
+                    dir="ltr"
+                    className={
+                      iceDiagnostics?.mode === 'relayed'
+                        ? 'text-amber-300 font-semibold'
+                        : 'text-emerald-300 font-semibold'
+                    }
+                  >
+                    {iceDiagnostics ? iceDiagnostics.label : 'LAN Direct'}
+                  </span>
+                  {iceDiagnostics?.protocol && (
+                    <>
+                      <span className="text-slate-600" aria-hidden="true">
+                        ·
+                      </span>
+                      <span className="text-slate-300">{iceDiagnostics.protocol}</span>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between text-slate-400">
+                <span>جهازك الحالي</span>
+                <div className="flex items-center gap-2 text-slate-200 font-medium">
+                  <DeviceIcon
+                    kind={localDevice.kind}
+                    os={localDevice.os}
+                    className="w-4 h-4 text-cyan-400"
+                  />
+                  <span>{localDevice.name}</span>
+                </div>
               </div>
             </div>
           </div>

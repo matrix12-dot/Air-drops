@@ -30,6 +30,7 @@ export default function App() {
     connectionState,
     mqttActive,
     remoteDevice,
+    iceDiagnostics,
     statusError,
     transfers,
     textDrops,
@@ -66,7 +67,7 @@ export default function App() {
           <div className="flex flex-wrap items-center gap-2.5 text-xs text-slate-400 shrink-0">
             <span>رمز PIN من 4 أرقام</span>
             <span aria-hidden="true">·</span>
-            <span>حزم ثنائية 64KB</span>
+            <span>حزم ثنائية 256KB</span>
             <span aria-hidden="true">·</span>
             <span>نقل LAN مباشر 100%</span>
           </div>
@@ -81,6 +82,7 @@ export default function App() {
               connectionState={connectionState}
               mqttActive={mqttActive}
               remoteDevice={remoteDevice}
+              iceDiagnostics={iceDiagnostics}
               statusError={statusError}
               onConnectWithPin={connectWithPin}
               onCancelConnect={cancelConnect}

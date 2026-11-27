@@ -159,7 +159,7 @@ export function FileTransferPanel({
         <div>
           <h2 className="text-lg font-bold text-slate-50">إرسال واستقبال الملفات</h2>
           <p className="text-xs sm:text-sm text-slate-400 mt-0.5">
-            نقل مباشر من جهاز لآخر بحزم 64KB لجميع الصيغ والأحجام الكبيرة بدون حد أقصى
+            نقل مباشر من جهاز لآخر بحزم 256KB لجميع الصيغ والأحجام الكبيرة بأقصى سرعة للشبكة المحلية
           </p>
         </div>
 
